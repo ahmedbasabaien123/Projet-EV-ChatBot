@@ -2,6 +2,10 @@ from flask import Flask, request, jsonify, make_response
 import mysql.connector
 from mysql.connector import errorcode
 import uuid # pour générer des identifiants de session uniques
+from fuzzywuzzy import fuzz
+import unicodedata
+
+common_words = set(["est", "la", "de", "le", "les", "et", "un", "une", "pour", "que", "en", "des"])
 
 app = Flask(__name__)
 
@@ -10,6 +14,7 @@ app.config['MYSQL_HOST'] = 'localhost'
 app.config['MYSQL_USER'] = 'root'
 app.config['MYSQL_PASSWORD'] = 'root'
 app.config['MYSQL_DB'] = 'clinique_chatbot'
+
 
 # Fonction pour obtenir une connexion à la base de données
 def get_db_connection():
@@ -29,23 +34,57 @@ def get_db_connection():
         else:
             print(err)
 
-# Fonction pour générer une réponse basée sur le message de l'utilisateur
+def remove_accents(input_str):
+    nfkd_form = unicodedata.normalize('NFKD', input_str)
+    return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+
+def calculate_similarity(user_keywords, faq_keywords):
+    user_keywords_str = " ".join(user_keywords)  # Convertir en chaîne
+    faq_keywords_str = " ".join(faq_keywords)  # Convertir en chaîne
+    return fuzz.token_set_ratio(user_keywords_str, faq_keywords_str) / 100.0
+
 def generate_response(user_message):
     try:
         # Connexion à la base de données
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Vérifier si la question existe dans les questions fréquentes
-        cursor.execute("SELECT answer FROM faq WHERE question LIKE %s", (f"%{user_message}%",))
-        result = cursor.fetchone()
-        
-        # Lire tous les résultats pour éviter "Unread result found"
-        while cursor.nextset():
-            cursor.fetchall()
+        # Séparer la question de l'utilisateur en mots-clés, supprimer les accents et filtrer les mots communs
+        user_keywords = set(remove_accents(user_message.lower()).split()) - common_words
+        print(f"User Keywords: {user_keywords}")  # Débogage
 
-        if result:
-            response = result[0]
+        # Récupérer toutes les questions fréquentes et leurs mots-clés
+        cursor.execute("SELECT question, answer, keywords FROM faq")
+        faqs = cursor.fetchall()
+
+        # Recherche de correspondance exacte
+        for faq in faqs:
+            if faq[0].lower() == user_message.lower():
+                return faq[1]
+
+        # Recherche de correspondance des mots-clés
+        best_match = None
+        best_match_similarity = 0
+
+        for faq in faqs:
+            faq_keywords = set(remove_accents(faq[2].lower()).split(',')) if faq[2] else set()
+            faq_keywords -= common_words
+            print(f"FAQ Keywords for '{faq[0]}': {faq_keywords}")  # Débogage
+
+            similarity = calculate_similarity(user_keywords, faq_keywords)
+            print(f"Similarity for '{faq[0]}': {similarity}")  # Débogage
+
+            # Ajouter une pondération pour les correspondances exactes
+            if faq[0].lower() == user_message.lower():
+                similarity += 0.5
+
+            if similarity > best_match_similarity:
+                best_match_similarity = similarity
+                best_match = faq
+
+        if best_match and best_match_similarity > 0.4:  # Seuil de similarité ajustable
+            response = best_match[1]
+            print(f"Best Match: {best_match[0]} with similarity {best_match_similarity}")  # Débogage
         else:
             # Réponses par défaut pour les messages généraux
             default_responses = {
