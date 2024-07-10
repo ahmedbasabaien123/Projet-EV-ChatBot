@@ -1,10 +1,19 @@
 from flask import Flask, request, jsonify, make_response
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
 import mysql.connector
 from mysql.connector import errorcode
 import uuid # pour générer des identifiants de session uniques
 from fuzzywuzzy import fuzz
 import unicodedata
+import re
+import string
+import spacy
 
+
+model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+nlp = spacy.load("fr_core_news_sm")
 common_words = set(["est", "la", "de", "le", "les", "et", "un", "une", "pour", "que", "en", "des"])
 
 app = Flask(__name__)
@@ -38,10 +47,12 @@ def remove_accents(input_str):
     nfkd_form = unicodedata.normalize('NFKD', input_str)
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
 
-def calculate_similarity(user_keywords, faq_keywords):
-    user_keywords_str = " ".join(user_keywords)  # Convertir en chaîne
-    faq_keywords_str = " ".join(faq_keywords)  # Convertir en chaîne
-    return fuzz.token_set_ratio(user_keywords_str, faq_keywords_str) / 100.0
+def normalize_text(text):
+    text = remove_accents(text)
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text).strip()  # Remove extra spaces and trim
+    text = text.translate(str.maketrans('', '', string.punctuation))  # Remove punctuation
+    return text
 
 def generate_response(user_message):
     try:
@@ -49,42 +60,37 @@ def generate_response(user_message):
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Séparer la question de l'utilisateur en mots-clés, supprimer les accents et filtrer les mots communs
-        user_keywords = set(remove_accents(user_message.lower()).split()) - common_words
-        print(f"User Keywords: {user_keywords}")  # Débogage
+        # Normaliser la question de l'utilisateur
+        normalized_user_message = normalize_text(user_message)
+        print(f"Normalized User Message: {normalized_user_message}")  # Débogage
 
-        # Récupérer toutes les questions fréquentes et leurs mots-clés
-        cursor.execute("SELECT question, answer, keywords FROM faq")
+        # Encoder la question de l'utilisateur
+        user_embedding = model.encode(normalized_user_message, convert_to_tensor=True)
+
+        # Récupérer toutes les questions fréquentes et leurs réponses
+        cursor.execute("SELECT question, answer FROM faq")
         faqs = cursor.fetchall()
 
-        # Recherche de correspondance exacte
-        for faq in faqs:
-            if faq[0].lower() == user_message.lower():
-                return faq[1]
-
-        # Recherche de correspondance des mots-clés
+        # Stocker les meilleures correspondances
         best_match = None
-        best_match_similarity = 0
+        best_match_score = -1
 
         for faq in faqs:
-            faq_keywords = set(remove_accents(faq[2].lower()).split(',')) if faq[2] else set()
-            faq_keywords -= common_words
-            print(f"FAQ Keywords for '{faq[0]}': {faq_keywords}")  # Débogage
+            normalized_faq_question = normalize_text(faq[0])
+            faq_embedding = model.encode(normalized_faq_question, convert_to_tensor=True)
+            score = util.pytorch_cos_sim(user_embedding, faq_embedding).item()
+            print(f"Comparing with: {normalized_faq_question}, Score: {score}")  # Débogage
 
-            similarity = calculate_similarity(user_keywords, faq_keywords)
-            print(f"Similarity for '{faq[0]}': {similarity}")  # Débogage
-
-            # Ajouter une pondération pour les correspondances exactes
-            if faq[0].lower() == user_message.lower():
-                similarity += 0.5
-
-            if similarity > best_match_similarity:
-                best_match_similarity = similarity
+            if score > best_match_score:
+                best_match_score = score
                 best_match = faq
 
-        if best_match and best_match_similarity > 0.4:  # Seuil de similarité ajustable
+        # Définir un seuil de similarité pour accepter une correspondance
+        similarity_threshold = 0.7  # Ajustez ce seuil selon vos besoins
+
+        if best_match and best_match_score >= similarity_threshold:
             response = best_match[1]
-            print(f"Best Match: {best_match[0]} with similarity {best_match_similarity}")  # Débogage
+            print(f"Best Match: {best_match[0]} with score {best_match_score}")  # Débogage
         else:
             # Réponses par défaut pour les messages généraux
             default_responses = {
@@ -92,10 +98,10 @@ def generate_response(user_message):
                 'au revoir': 'Au revoir ! Passez une excellente journée !',
                 'merci': 'De rien ! Je suis là pour vous aider.',
                 'pardon': 'Pas de problème ! Comment puis-je vous aider ?',
-                'comment ça va ?': 'Je suis juste un chatbot, mais merci de demander ! Comment puis-je vous aider aujourd\'hui ?'
+                'comment ça va': 'Je suis juste un chatbot, mais merci de demander ! Comment puis-je vous aider aujourd\'hui ?',
+                'ça va': 'Je suis juste un chatbot, mais merci de demander ! Comment puis-je vous aider aujourd\'hui ?'
             }
-            user_message_lower = user_message.lower()
-            response = default_responses.get(user_message_lower, "Excusez-moi, je ne suis pas sûr de cela. Veuillez nous contacter par 03 90 40 46 02 et nous serons heureux de vous aider.")
+            response = default_responses.get(normalized_user_message, "N'étant pas en mesure de répondre à cette question, je peux vous proposer de contacter l'équipe EXCEL Vision au 0800 200 388")
         
         return response
     except Exception as e:
@@ -104,6 +110,7 @@ def generate_response(user_message):
     finally:
         cursor.close()
         conn.close()
+
 
 @app.route('/')
 def home():
